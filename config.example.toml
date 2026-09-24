@@ -1,0 +1,57 @@
+# Copy to config.toml (git-ignored) and adjust. Secrets go in secrets.env, never here.
+
+[paths]
+state_dir = "state"                       # runner state (0700), relative to this file
+registrations = "state/registrations.json"  # written by register.py, read by runner.py
+secrets_file = "secrets.env"              # SITE_USER, SITE_PASSWORD, API keys, TELEGRAM_*
+
+[site]                                     # every field of autopilot.site.SiteProfile may be set here
+base = "http://127.0.0.1:8765/app/"        # the bundled mock platform
+timezone = "UTC"                         # IANA name, e.g. "Europe/Berlin"
+# material_hosts = ["drive.google.com", "drive.usercontent.google.com"]  # handout hosts besides the site itself
+
+[policy]
+pass_score = 80
+max_tries = 3          # deterministic attempts per step before the agent fallback
+max_graded = 2         # graded test results (first + one retry)
+preflight_at = "08:30"
+margin_minutes = 1     # act from window start + 1 min to window end - 1 min
+lookback_days = 3
+resend_minutes = 10
+
+[notify]
+type = "stdout"        # or "telegram" (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in secrets.env)
+
+# Answer providers are tried in order. No model is assumed: you must name one.
+# HTTP providers are model-only calls (no tools) -- prefer them for untrusted page text.
+[[answer.providers]]
+type = "static"        # demo only: answers every question with the same letter
+letter = "A"
+
+# [[answer.providers]]
+# type = "gemini"      # key: GEMINI_API_KEY
+# model = "<your model id>"
+#
+# [[answer.providers]]
+# type = "openai"      # ChatGPT / OpenAI API; key: OPENAI_API_KEY
+# model = "<your model id>"
+#
+# [[answer.providers]]
+# type = "anthropic"   # Claude API; key: ANTHROPIC_API_KEY
+# model = "<your model id>"
+#
+# [[answer.providers]]
+# type = "xai"         # Grok API; key: XAI_API_KEY
+# model = "<your model id>"
+#
+# [[answer.providers]]
+# type = "cli"         # an agent CLI as last resort (it HAS tools: documented risk)
+# name = "my-agent"
+# command = ["<agent-cli>", "<non-interactive flag>", "{prompt}"]   # see your CLI's docs
+# ({schema_file} is also available, e.g. for CLIs that accept a JSON schema file)
+
+# Optional fallback agent for page changes. It may only use autopilot/browser_helper.py.
+# [fallback]
+# command = ["<agent-cli>", "<non-interactive flag>", "{prompt}"]
+# success_json_field = "status"     # optional: a field in the CLI's JSON output that signals success
+# success_value = "SUCCESS"

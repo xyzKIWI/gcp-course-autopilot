@@ -1,0 +1,5 @@
+requests>=2.31
+beautifulsoup4>=4.12
+pypdf>=4.0
+# optional, only for the fallback browser helper:
+# playwright>=1.45
