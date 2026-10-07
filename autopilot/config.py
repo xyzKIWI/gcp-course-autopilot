@@ -1,8 +1,12 @@
 """config.toml + secrets.env loading. Secrets never live in config.toml."""
+import html
+import html.entities
 import json
 import os
+import re
 import tomllib
 from dataclasses import fields
+from functools import lru_cache
 from pathlib import Path
 
 from .site import SiteProfile
@@ -40,13 +44,26 @@ def load_secrets(path):
     return lambda key: os.environ.get(key) or result.get(key)
 
 
+@lru_cache(maxsize=32)
+def html_pattern(hidden):
+    """Regex for `hidden` as a page may print it: any character may be an HTML entity
+    (named, decimal or hex, escaped or not, in any mix)."""
+    def char(c):
+        forms = [re.escape(c), f'&#0*{ord(c)}(?:;|(?![0-9]))', f'&#[xX]0*(?i:{ord(c):x})(?:;|(?![0-9a-fA-F]))']
+        forms += [re.escape('&' + name) for name, v in html.entities.html5.items() if v == c]
+        return '(?:' + '|'.join(forms) + ')'
+    return re.compile(''.join(char(c) for c in hidden))
+
+
 def redact(value, secret):
-    """Replace secrets, including their JSON-escaped forms."""
+    """Replace secrets, including their JSON-escaped and HTML-escaped forms (pages may echo a value)."""
     value = str(value)
     if secret:
         for key in SECRET_KEYS:
             hidden = secret(key)
             if hidden:
-                for form in {hidden, json.dumps(hidden)[1:-1], json.dumps(hidden, ensure_ascii=False)[1:-1]}:
+                forms = {hidden, json.dumps(hidden)[1:-1], json.dumps(hidden, ensure_ascii=False)[1:-1]}
+                for form in sorted(forms, key=len, reverse=True):     # longest first: no partial leftovers
                     value = value.replace(form, '***')
+                value = html_pattern(hidden).sub('***', value)
     return value

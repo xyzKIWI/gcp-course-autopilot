@@ -9,6 +9,7 @@ secrets_file = "secrets.env"              # SITE_USER, SITE_PASSWORD, API keys, 
 base = "http://127.0.0.1:8765/app/"        # the bundled mock platform
 timezone = "UTC"                         # IANA name, e.g. "Europe/Berlin"
 # material_hosts = ["drive.google.com", "drive.usercontent.google.com"]  # handout hosts besides the site itself
+# retake_text = "Retake"                 # a graded test cell may show this button text after the score
 
 [policy]
 pass_score = 80
@@ -18,6 +19,8 @@ preflight_at = "08:30"
 margin_minutes = 1     # act from window start + 1 min to window end - 1 min
 lookback_days = 3
 resend_minutes = 10
+survey_delay_minutes = 3       # send the survey this long after the check-out time shown on the card,
+survey_min_left_minutes = 15   # unless waiting would leave less than this before the window ends
 
 [notify]
 type = "stdout"        # or "telegram" (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in secrets.env)

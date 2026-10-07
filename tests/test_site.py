@@ -3,7 +3,9 @@ import unittest
 from datetime import datetime, timedelta
 
 import requests
+from zoneinfo import ZoneInfo
 
+from autopilot import site
 from autopilot.site import Client, FormChanged, SiteError, SiteProfile, course_id_of, done, parse_cards, score
 from mock_site.server import PASSWORD, TZ, USER, Platform, serve
 
@@ -53,6 +55,12 @@ class Flow(MockSiteBase):
         c.attendance('signin', 'DEMO101', '100', FAR)
         self.assertNotIn(('POST', '/app/student/signin'), self.platform.log)
 
+    def test_graded_card_shows_retake_and_still_reads_as_score(self):
+        self.platform.progress['DEMO101'] = {'signin': '2026-10-07 13:51:00', 'exam': '67'}
+        card = self.c.cards()['DEMO101']
+        self.assertIn('Retake', self.c.last_page)
+        self.assertEqual(score(self.p, card['fields']['exam']), 67)
+
     def test_changed_form_is_detected(self):
         original = self.c._get
         def tampered(path, authenticated=True):
@@ -98,6 +106,27 @@ class Parsing(unittest.TestCase):
                 done(self.p, bad)
         with self.assertRaises(FormChanged):
             score(self.p, 'absent')
+
+    def exam_cell(self, cell):
+        rows = [('Check-in', 'Pending'), ('Check-out', 'Pending'), ('Survey', 'Pending'), ('Test score', cell)]
+        return parse_cards(self.p, self.card(rows=rows))['DEMO101']['fields']['exam']
+
+    def test_score_followed_by_retake_button(self):
+        value = self.exam_cell('90 <button type="button">Retake</button>')
+        self.assertEqual((value, score(self.p, value)), ('90', 90))
+
+    def test_retake_without_a_score_fails_closed(self):
+        for prefix in ('Pending', '', 'Absent', '90 points', '101', 'Retake 90'):
+            value = self.exam_cell(f'{prefix} <button type="button">Retake</button>')
+            with self.assertRaises(FormChanged, msg=prefix):
+                score(self.p, value)
+
+    def test_stamp_of(self):
+        p = SiteProfile(base=self.p.base, timezone='Etc/GMT-2')
+        self.assertEqual(site.stamp_of(p, '2026-10-07 15:51:02'),
+                         datetime(2026, 10, 7, 15, 51, 2, tzinfo=ZoneInfo('Etc/GMT-2')))
+        for bad in ('Pending', None, '', '2026-02-30 10:00:00', '2026-10-07 15:51'):
+            self.assertIsNone(site.stamp_of(p, bad), bad)
 
 
 class Transport(unittest.TestCase):

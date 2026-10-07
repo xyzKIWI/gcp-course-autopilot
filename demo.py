@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fast-forward one class day against the bundled mock platform (no network, no API key).
 
-    python demo.py            # happy path: register -> check-in -> check-out -> survey -> test
+    python demo.py            # happy path: register -> check-in -> check-out -> (wait) survey -> test
     python demo.py --wrong    # the static answerer picks wrong answers: see retry + manual alert
 """
 import argparse
@@ -46,17 +46,20 @@ letter = "{'B' if args.wrong else 'A'}"
         print('   ', line)
 
     state = {}
-    for hhmm in ('08:30', '13:51', '15:51', '15:52', '15:53', '16:31'):
+    for hhmm in ('08:30', '13:51', '15:51', '15:54', '15:55', '15:56', '16:31'):
         h, m = map(int, hhmm.split(':'))
         sim['now'] = sim['now'].replace(hour=h, minute=m)
         print(f'--- {hhmm} tick')
         regs, _ = runner.load_registrations(cfg['paths']['registrations'])
         courses, _ = runner.select_courses(regs, sim['now'])
         courses = [c for c in courses if not (state.get('courses', {}).get(c['cid']) or {}).get('closed')]
+        sent = []
         tick = runner.Tick(state, secret, sim['now'], clock=clock, profile=cfg['profile'], policy={},
-                           send=lambda text: print('    [notify]', text) or True,
+                           send=lambda text: print('    [notify]', text) or sent.append(text) or True,
                            agents=runner.Agents(cfg, cfg['_path'], clock))
-        tick.run(courses)
+        for line in tick.run(courses):
+            if line not in sent:
+                print('    [plan]', line)   # e.g. the survey waiting a few minutes after check-out
         runner.check_state(json.loads(json.dumps(state)))
     print('--- final student card')
     card = state['courses']['DEMO101']

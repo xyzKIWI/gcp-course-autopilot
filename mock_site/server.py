@@ -1,8 +1,9 @@
 """A small, dependency-free mock course platform for demos and end-to-end tests.
 
 It imitates a generic server-rendered e-learning platform: CSRF tokens, a student
-card with status rows, check-in/out forms that require the account password and the
-registration serial, a survey, a multiple-choice test and a registration flow. Time comes
+card with status rows (a graded test cell also carries a "Retake" button), check-in/out
+forms that require the account password and the registration serial, a survey, a
+multiple-choice test and a registration flow. Time comes
 from an injectable clock so demos and tests can "fast-forward" through a class day.
 
     python -m mock_site.server --port 8765     # then open http://127.0.0.1:8765/app/account/login
@@ -164,7 +165,9 @@ def make_handler(platform):
             out = []
             for cid, serial in P.registrations.items():
                 c, pr = P.courses[cid], P.progress.setdefault(cid, {})
-                rows = ''.join(f'<tr><th>{label}</th><td>{html.escape(str(pr.get(key, PENDING)))}</td></tr>'
+                retake = ' <button type="button" class="retake">Retake</button>' if 'exam' in pr else ''
+                rows = ''.join(f'<tr><th>{label}</th><td>{html.escape(str(pr.get(key, PENDING)))}'
+                               f'{retake if key == "exam" else ""}</td></tr>'
                                for key, label in (('signin', 'Check-in'), ('signout', 'Check-out'),
                                                   ('survey', 'Survey'), ('exam', 'Test score')))
                 out.append(f'<div class="card"><h5>{html.escape(c["title"])}</h5><div class="serial">{serial}</div>'

@@ -148,6 +148,23 @@ class Workspace(unittest.TestCase):
         self.assertEqual(sum('找不到報名狀態檔' in s for s in sent), 1)
         self.assertTrue(any('結構不對' in s for s in sent))
 
+    def test_diagnosis_copies_only_on_real_runs(self):
+        register.run(self.cfg, now=self.now[0], send=lambda t: None)
+        self.platform.progress['DEMO101'] = {'signin': 'Expired'}
+        at = self.now[0].replace(hour=13, minute=51).isoformat()
+        state_dir = self.dir / 'state'
+        with mock.patch('sys.stdout'):
+            runner.main(['--config', str(self.dir / 'config.toml'), '--dry-run', '--now', at])
+            self.assertFalse((state_dir / 'diag').exists())
+            state_dir.mkdir(mode=0o700)
+            runner.tick_once(self.cfg, SimpleNamespace(dry_run=False, now=at), {}, state_dir / 'state.json', None)
+        files = list((state_dir / 'diag').iterdir())
+        self.assertEqual(len(files), 1)
+        self.assertTrue(files[0].name.endswith('_DEMO101_signin_unknown.html'))
+        self.assertIn('Expired', files[0].read_text())
+        self.assertNotIn(PASSWORD, files[0].read_text())
+        self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+
     def test_main_never_writes_registrations(self):
         reg = self.dir / 'registrations.json'
         reg.write_text(json.dumps({'courses': {}}))

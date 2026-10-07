@@ -10,7 +10,8 @@ with the same shape. The client is deliberately strict:
   anything unexpected raises FormChanged so the caller can fall back instead of guessing;
 * the deadline is checked immediately before every mutating POST;
 * card status is fail-closed: only a real timestamp is "done", only the exact pending
-  text is "pending", anything else is an unknown state.
+  text is "pending", anything else is an unknown state (the one tolerated extra is a
+  retake button next to a test score: "<score> <retake_text>" reads as "<score>").
 """
 import re
 from dataclasses import dataclass, field
@@ -53,6 +54,7 @@ class SiteProfile:
         'signin': 'Check-in', 'signout': 'Check-out', 'survey': 'Survey', 'exam': 'Test score'})
     pending: str = 'Pending'
     stamp_format: str = '%Y-%m-%d %H:%M:%S'     # strptime format of a completed step
+    retake_text: str = 'Retake'                 # button text a graded test cell may carry after the score
     exam_receipt: str = 'Test submitted successfully'
     survey_best_value: str = '5'                # value of the most favourable option in each group
     survey_values: tuple = ('1', '2', '3', '4', '5')
@@ -88,6 +90,24 @@ def done(profile, value):
         return True
     except ValueError:
         raise FormChanged('unknown_field_value') from None
+
+
+def stamp_of(profile, value):
+    """Platform time of a completed step (aware, in the site's timezone), or None if not a timestamp."""
+    try:
+        stamp = datetime.strptime((value or '').strip(), profile.stamp_format)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=profile.tz)
+
+
+def exam_cell(profile, value):
+    """'<score> <retake_text>' -> '<score>'; any other value is returned unchanged (score() decides)."""
+    if profile.retake_text:
+        m = re.fullmatch(r'(\d{1,3})\s*' + re.escape(profile.retake_text), value)
+        if m:
+            return m.group(1)
+    return value
 
 
 def score(profile, value):
@@ -136,8 +156,11 @@ def parse_cards(profile, html):
         serial = node.select_one(profile.serial_selector)
         material = next((urljoin(profile.base, a['href']) for a in node.select('a[href]')
                          if text(a) == profile.material_link_text), None)
+        fields = {k: rows[v] for k, v in labels.items()}
+        if 'exam' in fields:
+            fields['exam'] = exam_cell(profile, fields['exam'])   # only "<score> Retake"; anything else fails closed
         cards[cid] = {'cid': cid, 'serial': text(serial) if serial else None,
-                      'fields': {k: rows[v] for k, v in labels.items()}, 'material': material}
+                      'fields': fields, 'material': material}
     return cards
 
 
@@ -231,6 +254,7 @@ class Client:
 
     def cards(self):
         html, _ = self._get(self.p.card_path)
+        self.last_page = html   # kept only so a card the runner cannot interpret can be saved for diagnosis
         return parse_cards(self.p, html)
 
     # ---- forms ---------------------------------------------------------

@@ -4,8 +4,10 @@ Reads registered courses from the registration state (read-only). On a class day
 checks in, checks out, fills the survey and takes the course test inside the platform's
 windows, verifying each step on the student card. The real clock is re-checked right
 before every submission. Failures alert on first occurrence, fall back to an AI agent
-once, and always end in a notification (retried until delivered). --dry-run logs in and
-reads the card but never posts a form, calls a model/agent, notifies or writes anything.
+once, and always end in a notification (retried until delivered). Platform pages the program
+could not make sense of are kept, redacted, under <state_dir>/diag/ for a human to inspect.
+--dry-run logs in and reads the card but never posts a form, calls a model/agent, notifies
+or writes anything.
 """
 import argparse
 import fcntl
@@ -21,7 +23,7 @@ from urllib.parse import urlparse
 from . import answering, fallback
 from .config import load_config, load_secrets, redact
 from .notify import make_notifier
-from .site import STEPS, Client, FormChanged, SiteError, done, score
+from .site import STEPS, Client, FormChanged, SiteError, done, score, stamp_of
 
 LABEL = {'signin': '簽到', 'signout': '簽退', 'survey': '滿意度', 'exam': '課後測驗'}
 
@@ -62,6 +64,9 @@ class Tick:
         self.preflight_at = time.fromisoformat(policy.get('preflight_at', '08:30'))
         self.margin = timedelta(minutes=policy.get('margin_minutes', 1))
         self.resend_after = timedelta(minutes=policy.get('resend_minutes', 10))
+        # some platforms answer 200 but drop a survey sent right after check-out: hold it a little
+        self.survey_delay = timedelta(minutes=policy.get('survey_delay_minutes', 3))
+        self.survey_min_left = timedelta(minutes=policy.get('survey_min_left_minutes', 15))
         self.state = state
         self.secret = secret
         self.now = now
@@ -71,6 +76,7 @@ class Tick:
         self.send = send
         self.clock = clock or (lambda: datetime.now(self.p.tz))   # real time, re-read before every submission
         self.save_now = lambda: None   # main() points this at the state file (persist before risky steps)
+        self.diag_dir = None   # tick_once points this at <state_dir>/diag on real runs (never in dry-run)
         self.plan = []   # human-readable actions (dry-run output and log)
 
     # ---- helpers -------------------------------------------------------
@@ -125,16 +131,35 @@ class Tick:
         """True if the real clock leaves at least `need` seconds before the window end."""
         return (end - self.clock()).total_seconds() >= need   # the end minute itself is inside the window
 
+    def dump(self, name, page):
+        """Diagnosis only: keep a redacted copy of a platform page (never read back by the program)."""
+        if self.dry or self.diag_dir is None or not page:
+            return
+        try:
+            self.diag_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(self.diag_dir, 0o700)
+            path = self.diag_dir / f'{self.clock():%Y%m%d-%H%M%S}_{name}.html'
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w', encoding='utf-8', errors='replace') as f:
+                f.write(redact(page, self.secret))
+            os.chmod(path, 0o600)
+        except OSError:
+            pass   # a diagnosis copy must never stop the real work
+
+    def dump_card(self, course, step, why):
+        self.dump(f"{course['cid']}_{step}_{why}", getattr(self._client, 'last_page', None))
+
     def unknown(self, course, rec, step, value):
+        self.dump_card(course, step, 'unknown')
         rec['steps'][step]['gave_up'] = True
         self.say(f"{course['cid']}:{step}:unknown",
                  f"❌ 課程 {course['cid']} {LABEL[step]}：學員卡出現無法辨識的狀態「{value}」，程式停手，請手動確認。")
         return False
 
-    def first_failure(self, course, step, error, end):
+    def first_failure(self, course, step, error, end, tries=1):
         self.say(f"{course['cid']}:{step}:retrying",
-                 f"⚠️ 課程 {course['cid']} {LABEL[step]}第一次失敗（{error}），窗內持續自動重試（到 {end:%H:%M}）。"
-                 '若你方便，也可以直接手動處理。')
+                 f"⚠️ 課程 {course['cid']} {LABEL[step]}{'第一次失敗' if tries == 1 else f'已 {tries} 次未成功'}（{error}），"
+                 f"窗內持續自動重試（到 {end:%H:%M}）。若你方便，也可以直接手動處理。")
 
     # ---- scheduling ----------------------------------------------------
     def windows(self, course):
@@ -224,6 +249,7 @@ class Tick:
             self.mark(course, rec, step, value)
             return
         rec['steps'][step]['expired'] = True
+        self.dump_card(course, step, 'expired')
         self.say(f'{cid}:{step}:expired', f"❌ 課程 {cid}「{title}」{LABEL[step]}已過時間窗仍未完成（學員卡：{value}），請手動確認。")
 
     def preflight(self, course, rec):
@@ -250,6 +276,7 @@ class Tick:
                 self.plan.append(f'{cid}: target card changed ({exc}); would hand over to the agent')
                 return False
             state['error'] = self.code(exc)
+            self.dump_card(course, step, 'changed')
             self.first_failure(course, step, state['error'], end)
             return self.fallback(course, rec, step, end)
         if step == 'exam':
@@ -260,6 +287,12 @@ class Tick:
                 return self.mark(course, rec, step, value)
         except FormChanged:
             return self.unknown(course, rec, step, value)
+        if step == 'survey':
+            hold = self.survey_hold(card, end)
+            if hold:
+                self.plan.append(f'{cid}: survey waits until {hold:%H:%M:%S} '
+                                 f'(card check-out time + {self.survey_delay.total_seconds() / 60:g} min)')
+                return False
         if self.dry:
             self.plan.append(f'{cid}: would {step}')
             return False
@@ -270,7 +303,7 @@ class Tick:
                                                 f"為避免重複送出，程式停手；請在 {end:%H:%M} 前手動確認。")
             return False
         state['pending'] = None   # 'answered' (platform replied) is safe to retry
-        changed = False
+        changed, page = False, None
         if state['tries'] < self.max_tries:
             if not self.still_open(end):
                 return False   # the window closed while this tick was running
@@ -280,10 +313,11 @@ class Tick:
             try:
                 client = self.client()
                 if step == 'survey':
-                    client.survey(cid, end)
+                    page = client.survey(cid, end)
                 else:
-                    client.attendance(step, cid, course['serial'], end)
+                    page = client.attendance(step, cid, course['serial'], end)
                 state['pending'] = 'answered'   # the platform replied (HTTP 200); card decides success
+                state['error'] = None
             except FormChanged as exc:
                 changed, state['error'], state['pending'] = True, self.code(exc), None   # rejected before sending
             except SiteError as exc:
@@ -300,11 +334,23 @@ class Tick:
                 state['pending'] = None
             if finished:
                 return self.mark(course, rec, step, value)
-            if state['tries'] == 1:
-                self.first_failure(course, step, state['error'] or 'card_not_updated', end)
+            state['error'] = state['error'] or 'card_not_updated'
+            self.dump(f"{cid}_{step}_try{state['tries']}", page)   # what the platform answered instead
+            # a survey reply the card ignores is retried once quietly; errors still alert on the first try
+            quiet = step == 'survey' and state['error'] == 'card_not_updated' and state['tries'] < 2
+            if not quiet and f'{cid}:{step}:retrying' not in self.state.get('notices', {}):
+                self.first_failure(course, step, state['error'], end, state['tries'])   # once per step
         if (changed or state['tries'] >= self.max_tries) and not state['agent']:
             return self.fallback(course, rec, step, end)
         return False
+
+    def survey_hold(self, card, end):
+        """Until when the survey should wait (survey_delay after the card's check-out time), or None."""
+        checked_out = stamp_of(self.p, card['fields']['signout'])
+        if checked_out is None:
+            return None
+        ready = checked_out + self.survey_delay
+        return ready if self.now < ready and end - ready >= self.survey_min_left else None
 
     def peek(self, course, step):
         """Card value for `step`, or None if the target card itself is structurally broken."""
@@ -638,6 +684,7 @@ def tick_once(cfg, args, state, path, corrupt):
                 agents=Agents(cfg, cfg['_path'], clock))
     if not args.dry_run:
         tick.save_now = lambda: save(path, state)
+        tick.diag_dir = path.parent / 'diag'
     try:
         for key, message in problems:
             tick.say(key, message)

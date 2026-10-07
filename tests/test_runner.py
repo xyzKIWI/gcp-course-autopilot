@@ -1,15 +1,18 @@
+import html
 import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest import mock
 
 from autopilot import runner
-from autopilot.site import SiteError, FormChanged, SiteProfile
+from autopilot.site import SiteError, FormChanged, SiteProfile, parse_cards
 from autopilot.runner import Tick, select_courses
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo('Etc/GMT-2')   # fixed UTC+2 for deterministic tests
-PROFILE = SiteProfile(base='http://127.0.0.1:1/app/')
+PROFILE = SiteProfile(base='http://127.0.0.1:1/app/', timezone='Etc/GMT-2')   # card stamps read in the test clock's zone
 
 ST = '2026-10-07 13:51:02'
 
@@ -625,6 +628,248 @@ class Selection(unittest.TestCase):
         autoreg['courses']['DEMO2026012'].update(dict(DETAIL, checkin_start='2026-10-05T13:50:00+02:00',
                                                           checkin_end='2026-10-05T14:20:00+02:00'))
         self.assertEqual(pick(), ['DEMO2026008', 'DEMO2026012'])
+
+
+# ---- retake button, survey timing, diagnosis copies ---------------------------
+DONE2 = {'signin': ST, 'signout': ST}
+DONE3 = {'signin': ST, 'signout': ST, 'survey': ST}
+RETAKE = ' <button type="button">Retake</button>'
+
+
+class StubAgents:
+    """Answers every question with 'A'; the single fallback reports completion but changes nothing."""
+
+    def __init__(self):
+        self.fallbacks = []
+
+    def answer(self, course, paper, material, secret=None, **kw):
+        return {'1': 'A'}, [], 'provider-a'
+
+    def fallback(self, course, step, secret=None, on_start=None, **kw):
+        if on_start:
+            on_start()
+        self.fallbacks.append(step)
+        return 'completed'
+
+
+def run_tick(now, client, state=None, *, dry=False, policy=None, diag=None, secret=SECRETS, agents=None):
+    sent = []
+    t = Tick(state if state is not None else {}, secret, now, dry_run=dry, client=client, agents=agents or StubAgents(),
+             send=lambda text: sent.append(text) or True, clock=lambda: now, profile=PROFILE, policy=policy)
+    t.diag_dir = diag
+    t.run([COURSE])
+    return t, sent
+
+
+class Timed(FakeClient):
+    """Check-out is stamped with its own time; survey replies can raise or be ignored by the card."""
+
+    def __init__(self, *a, out_at='2026-10-07 15:51:02', sticks=True, survey_errors=(), echo='', **kw):
+        super().__init__(*a, **kw)
+        self.out_at, self.sticks, self.survey_errors, self.echo = out_at, sticks, list(survey_errors), echo
+        self.replies = 0
+
+    def attendance(self, kind, cid, serial, deadline):
+        self._act(kind, self.out_at if kind == 'signout' else ST)
+        return '<html>attendance reply</html>'
+
+    def survey(self, cid, deadline):
+        self.calls.append('survey')
+        if self.survey_errors:
+            raise self.survey_errors.pop(0)
+        self.replies += 1
+        if self.sticks:
+            self.fields['survey'] = '2026-10-07 15:58:00'
+        return f'<html>reply {self.replies}: {self.echo}</html>'
+
+
+class CardPage(FakeClient):
+    """The card goes through the real HTML parser; the raw page is kept as Client.cards() does."""
+
+    def cards(self):
+        rows = ''.join(f'<tr><th>{label}</th><td>{self.fields[key]}</td></tr>' for key, label in PROFILE.labels.items())
+        self.last_page = (f'<div class="card"><div class="serial">{self.serial}</div><table>{rows}</table>'
+                          '<a href="/app/course/info?course_id=DEMO2026008">Course info</a></div>')
+        return parse_cards(PROFILE, self.last_page)
+
+
+class RetakeButton(unittest.TestCase):
+    def test_score_with_retake_button_counts_inside_window(self):
+        c = CardPage({**DONE3, 'exam': '90' + RETAKE})
+        t, sent = run_tick(at('15:55'), c)
+        self.assertTrue(t.state['courses']['DEMO2026008']['steps']['exam']['done'])
+        self.assertNotIn('exam_submit', c.calls)
+        self.assertFalse(any('無法辨識' in s for s in sent))
+
+    def test_window_end_check_accepts_score_with_retake_button(self):
+        c = CardPage({**DONE3, 'exam': '90' + RETAKE})
+        t, sent = run_tick(at('16:30'), c)
+        steps = t.state['courses']['DEMO2026008']['steps']
+        self.assertTrue(all(steps[s]['done'] for s in runner.STEPS))
+        self.assertFalse(any('❌' in s for s in sent))
+
+    def test_retake_text_without_a_score_still_stops(self):
+        for cell in ('Pending' + RETAKE, 'Absent' + RETAKE, RETAKE, '90 points' + RETAKE, '101' + RETAKE):
+            with self.subTest(cell=cell):
+                c, state = CardPage({**DONE3, 'exam': cell}), {}
+                _, sent = run_tick(at('15:55'), c, state)
+                self.assertNotIn('exam_fetch', c.calls)
+                self.assertTrue(any('無法辨識' in s for s in sent))
+                _, sent = run_tick(at('16:30'), c, state)
+                self.assertTrue(any('已過時間窗仍未完成' in s for s in sent))
+
+
+class SurveyWait(unittest.TestCase):
+    def test_survey_waits_after_card_checkout_time(self):
+        c, state = Timed({'signin': ST}), {}
+        run_tick(at('15:51'), c, state)
+        self.assertEqual(c.calls, ['signout'])
+        t, _ = run_tick(at('15:54'), c, state)   # 15:51:02 + 3 min = 15:54:02: not yet
+        self.assertEqual(c.calls, ['signout'])
+        self.assertIn('DEMO2026008: survey waits until 15:54:02 (card check-out time + 3 min)', t.plan)
+        run_tick(at('15:55'), c, state)
+        self.assertEqual(c.calls, ['signout', 'survey', 'exam_fetch', 'exam_submit'])
+
+    def test_dry_run_plan_names_the_wait(self):
+        c = Timed({'signin': ST, 'signout': '2026-10-07 15:51:02'})
+        t, sent = run_tick(at('15:52'), c, dry=True)
+        self.assertIn('DEMO2026008: survey waits until 15:54:02 (card check-out time + 3 min)', t.plan)
+        self.assertNotIn('DEMO2026008: would survey', t.plan)
+        self.assertEqual((c.calls, sent), ([], []))
+
+    def test_late_checkout_does_not_wait(self):
+        c = Timed({'signin': ST}, out_at='2026-10-07 16:20:00')
+        run_tick(at('16:20'), c)   # waiting until 16:23 would leave < 15 min before 16:29
+        self.assertEqual(c.calls[:2], ['signout', 'survey'])
+
+    def test_wait_is_configurable(self):
+        policy = {'survey_delay_minutes': 5, 'survey_min_left_minutes': 30}
+        t, _ = run_tick(at('15:55'), Timed({'signin': ST, 'signout': '2026-10-07 15:51:02'}), policy=policy)
+        self.assertIn('DEMO2026008: survey waits until 15:56:02 (card check-out time + 5 min)', t.plan)
+        c = Timed({'signin': ST, 'signout': '2026-10-07 16:00:00'})
+        run_tick(at('16:01'), c, policy=policy)   # 16:05 leaves 24 min (< 30) before 16:29: send now
+        self.assertEqual(c.calls[:1], ['survey'])
+
+
+class SurveyAlerts(unittest.TestCase):
+    def test_ignored_survey_alerts_on_second_try_then_hands_over(self):
+        c, state, agents = Timed(DONE2, sticks=False), {}, StubAgents()
+        _, sent1 = run_tick(at('15:55'), c, state, agents=agents)
+        self.assertFalse(any('滿意度' in s and '⚠️' in s for s in sent1))   # first ignored reply: quiet retry
+        _, sent2 = run_tick(at('15:56'), c, state, agents=agents)
+        self.assertTrue(any('滿意度已 2 次未成功（card_not_updated）' in s for s in sent2))
+        _, sent3 = run_tick(at('15:57'), c, state, agents=agents)
+        self.assertEqual(agents.fallbacks, ['survey'])
+        self.assertFalse(any('未成功' in s for s in sent3))   # the retry alert is sent once per step
+        self.assertTrue(any('程式失敗（card_not_updated）' in s for s in sent3))
+
+    def test_survey_error_alerts_on_first_try_and_only_once(self):
+        c, state = Timed(DONE2, sticks=False, survey_errors=[SiteError('network_error')]), {}
+        _, sent1 = run_tick(at('15:55'), c, state)
+        self.assertTrue(any('滿意度第一次失敗（network_error）' in s for s in sent1))
+        _, sent2 = run_tick(at('15:56'), c, state)   # a reply this time, card still not updated
+        self.assertEqual(c.calls.count('survey'), 2)
+        self.assertFalse(any('滿意度' in s and '⚠️' in s for s in sent2))
+
+    def test_attendance_miss_still_alerts_on_first_try(self):
+        class Ignored(Timed):
+            def attendance(self, kind, cid, serial, deadline):
+                self.calls.append(kind)
+                return '<html>reply</html>'
+        _, sent = run_tick(at('15:51'), Ignored({'signin': ST}))
+        self.assertTrue(any('簽退第一次失敗（card_not_updated）' in s for s in sent))
+
+
+class Diagnosis(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.diag = Path(self.tmp.name) / 'diag'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def files(self):
+        return sorted(self.diag.iterdir()) if self.diag.exists() else []
+
+    def test_unknown_card_saved_redacted_and_private(self):
+        c = FakeClient({'signin': 'Expired'})
+        c.last_page = f'<html>card Expired {PW} TGTOKEN123</html>'
+        run_tick(at('13:51'), c, diag=self.diag)
+        files = self.files()
+        self.assertEqual([f.name for f in files], ['20261007-135100_DEMO2026008_signin_unknown.html'])
+        body = files[0].read_text()
+        self.assertIn('card Expired', body)
+        self.assertNotIn(PW, body)
+        self.assertNotIn('TGTOKEN123', body)
+        self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.diag.stat().st_mode & 0o777, 0o700)
+
+    def test_expired_card_saved(self):
+        c = FakeClient()
+        c.last_page = '<html>card still Pending</html>'
+        run_tick(at('14:20'), c, diag=self.diag)
+        self.assertEqual([f.name.split('_', 1)[1] for f in self.files()], ['DEMO2026008_signin_expired.html'])
+
+    def test_ignored_reply_saved_with_html_escaped_secret_masked(self):
+        pw = 'a&b"c<d\'e'
+        secret = {'SITE_USER': 'user@example.com', 'SITE_PASSWORD': pw}.get
+        echo = ' | '.join([pw, html.escape(pw), html.escape(pw).replace('&#x27;', '&#39;'),
+                           html.escape(pw, quote=False), 'a&amp;b&#34;c&lt;d&#39;e'])
+        c, state = Timed(DONE2, sticks=False, echo=echo), {}
+        run_tick(at('15:55'), c, state, diag=self.diag, secret=secret)
+        run_tick(at('15:56'), c, state, diag=self.diag, secret=secret)
+        files = self.files()
+        self.assertEqual([f.name.split('_', 1)[1] for f in files],
+                         ['DEMO2026008_survey_try1.html', 'DEMO2026008_survey_try2.html'])
+        for f in files:
+            body = f.read_text()
+            self.assertIn('reply', body)
+            for leak in (pw, 'a&b', 'a&amp;b', '&lt;d', 'c<d'):
+                self.assertNotIn(leak, body)
+            self.assertEqual(f.stat().st_mode & 0o777, 0o600)
+
+    def test_redaction_covers_html_escaped_forms(self):
+        secret = {'SITE_PASSWORD': "x&y'z\"w"}.get
+        for form in ("x&amp;y&#x27;z&quot;w", "x&amp;y&#39;z&#34;w", "x&amp;y'z\"w", "x&#38;y&apos;z&#X22;w"):
+            self.assertEqual(runner.redact(f'[{form}]', secret), '[***]')
+
+    def test_redaction_covers_mixed_and_numeric_entities(self):
+        secret = {'SITE_PASSWORD': 'a&b"c<d\'e'}.get
+        for form in ('a&b&#34;c<d&#x27;e', 'a&#38;b"c&lt;d\'e', '&#97;&amp;b&#x22;c&LT;d&#039;e', 'a&ampb"c<d\'e',
+                     'a&#38b&#34c<d&#39e'):
+            self.assertEqual(runner.redact(f'[{form}]', secret), '[***]')
+        self.assertEqual(runner.redact('[a&b"c>d\'e]', secret), '[a&b"c>d\'e]')   # a different value stays
+        self.assertEqual(runner.redact('[a&#381b"c<d\'e]', secret), '[a&#381b"c<d\'e]')   # &#381 is another character
+
+    def test_changed_card_saved_before_hand_over(self):
+        c = FakeClient()
+        c.card_error = 'card_status_rows'
+        c.last_page = f'<html>new layout {PW}</html>'
+        run_tick(at('13:51'), c, diag=self.diag)
+        files = self.files()
+        self.assertEqual([f.name.split('_', 1)[1] for f in files], ['DEMO2026008_signin_changed.html'])
+        self.assertNotIn(PW, files[0].read_text())
+
+    def test_dry_run_never_writes(self):
+        for now, client in ((at('13:51'), FakeClient({'signin': 'Expired'})), (at('14:20'), FakeClient()),
+                            (at('15:55'), Timed(DONE2, sticks=False))):
+            client.last_page = '<html>card</html>'
+            run_tick(now, client, dry=True, diag=self.diag)
+        self.assertFalse(self.diag.exists())
+
+    def test_write_failure_does_not_interrupt(self):
+        blocker = Path(self.tmp.name) / 'not-a-dir'
+        blocker.write_text('')
+        c, state = Timed(DONE2, sticks=False), {}
+        run_tick(at('15:55'), c, state, diag=blocker / 'diag')
+        _, sent = run_tick(at('15:56'), c, state, diag=blocker / 'diag')
+        self.assertEqual(c.calls.count('survey'), 2)
+        self.assertTrue(any('滿意度' in s and '⚠️' in s for s in sent))
+        c = FakeClient({'signin': 'Expired'})
+        c.last_page = '<html>card</html>'
+        _, sent = run_tick(at('13:51'), c, diag=blocker / 'diag')
+        self.assertTrue(any('無法辨識' in s for s in sent))
+
 
 if __name__ == '__main__':
     unittest.main()
